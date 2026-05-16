@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "eterna-trading": {
+      "type": "streamable-http",
+      "url": "https://mcp.eterna.exchange/mcp"
+    }
+  }
+}

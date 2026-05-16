@@ -1,64 +1,61 @@
 """
 Pre-built strategy prompts for the trading agent.
-
-Pass one of these as the instruction to agent.run_agent() to run a specific strategy.
 """
 
 STRATEGIES = {
-    "momentum": (
-        "Scan BTCUSDT, ETHUSDT, and SOLUSDT for momentum trading opportunities. "
-        "Look for symbols with RSI between 50-65 (bullish momentum) or 35-50 (bearish momentum), "
-        "confirmed by MACD histogram direction. "
-        "Check that price is trending above (long) or below (short) the 50-period EMA. "
-        "If a clear setup exists with at least 2:1 reward/risk, enter a trade. "
-        "Set stop-loss 1.5x ATR below entry for longs, above for shorts."
-    ),
-
-    "mean_reversion": (
-        "Look for mean reversion setups on BTCUSDT, ETHUSDT, or SOLUSDT. "
-        "Find symbols where price has touched or broken the lower Bollinger Band (oversold) "
-        "or upper Bollinger Band (overbought). "
-        "Confirm with RSI below 30 (oversold, go long) or above 70 (overbought, go short). "
-        "Target the middle Bollinger Band as take-profit. "
-        "Use conservative leverage (3x max) for mean reversion trades."
-    ),
-
-    "trend_following": (
-        "Identify the strongest trending symbol among BTCUSDT, ETHUSDT, and SOLUSDT. "
-        "A strong trend is defined as: price above/below 20 and 50 EMA, "
-        "MACD signal line crossed bullish/bearish, and RSI between 45-65 (not overbought). "
-        "Enter in the trend direction on a pullback to the 20 EMA. "
-        "Trail stop-loss at the 20 EMA."
-    ),
-
-    "breakout": (
-        "Scan BTCUSDT, ETHUSDT, and SOLUSDT for Bollinger Band squeeze breakouts. "
-        "A squeeze occurs when the bands are narrow (low volatility). "
-        "A breakout is when price closes above the upper band (bullish) or below the lower band (bearish) "
-        "with increasing volume. Enter on breakout confirmation with a stop just inside the band. "
-        "Target 2x the band width as take-profit."
-    ),
-
-    "portfolio_review": (
-        "Review the current portfolio: check account balance, all open positions, and open orders. "
-        "For each open position, evaluate whether the original thesis still holds based on current "
-        "price action and indicators. "
-        "Update or close positions that are no longer valid. "
-        "Report a summary of the portfolio status and any actions taken."
+    "momentum_scalping": (
+        "Run the momentum scalping strategy on the preferred symbols. "
+        "Steps:\n"
+        "1. Call get_balance and get_positions to assess current state.\n"
+        "2. If fewer than 4 positions are open, scan get_tickers for symbols with "
+        "|price24hPcnt| > 0.3%.\n"
+        "3. For each candidate, call get_orderbook to confirm direction "
+        "(bid_vol >= 1.1x ask_vol for long, ask_vol >= 1.1x bid_vol for short).\n"
+        "4. Skip symbols already in positions.\n"
+        "5. For confirmed setups: call get_instruments for lotSize, calculate qty "
+        "(equity/4 / lastPrice, rounded to lotSize), then place_order with 5x leverage, "
+        "stopLoss at 0.6% from entry, takeProfit at 1.0% from entry.\n"
+        "6. Report all actions taken and any positions already open."
     ),
 
     "market_scan": (
-        "Perform a comprehensive market analysis. "
-        "Check account status, then analyze BTCUSDT, ETHUSDT, SOLUSDT, and BNBUSDT. "
-        "For each symbol, fetch RSI, MACD, and Bollinger Bands. "
-        "Identify the top 1-2 highest-conviction setups. "
-        "Provide a detailed market report but do NOT place any trades — analysis only."
+        "Perform a market analysis — no trades. "
+        "Call get_balance, get_positions, get_orders. "
+        "Call get_tickers for BTCUSDT, ETHUSDT, SOLUSDT and check price24hPcnt, "
+        "fundingRate, and volume24h. "
+        "Call get_orderbook for each to assess bid/ask imbalance. "
+        "Summarize the market state and identify 1-2 highest-conviction setups "
+        "(but do NOT place any orders)."
+    ),
+
+    "portfolio_review": (
+        "Review the current portfolio. "
+        "Call get_balance, get_positions, get_orders. "
+        "For each open position, report symbol, side, size, entry price, current mark price, "
+        "unrealised PnL, and stop-loss/take-profit levels. "
+        "Identify any positions missing stop-losses. "
+        "Report total equity, margin utilisation, and overall PnL."
+    ),
+
+    "close_all": (
+        "Close all open positions and cancel all open orders. "
+        "First call get_positions to list all open positions. "
+        "Then call close_position for each one. "
+        "Then call get_orders and use close_position with reduceOnly=true for any remaining. "
+        "Confirm the final state with get_balance and get_positions."
+    ),
+
+    "deposit": (
+        "Help me deposit USDT to start trading. "
+        "Call get_deposit_address with coin='USDT' and chainType='ARBI'. "
+        "Report the deposit address clearly. "
+        "Then call get_deposit_records to show any pending or recent deposits. "
+        "Explain that deposits on Arbitrum typically confirm in 1-5 minutes."
     ),
 }
 
 
 def get_strategy(name: str) -> str:
-    """Return the instruction string for a named strategy."""
     if name not in STRATEGIES:
         available = ", ".join(STRATEGIES.keys())
         raise ValueError(f"Unknown strategy '{name}'. Available: {available}")

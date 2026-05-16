@@ -1,147 +1,154 @@
 """
-MCP client for the Eterna Trading platform.
-Implements the streamable-HTTP JSON-RPC 2.0 protocol.
+Async MCP client for the Eterna Trading Gateway.
+
+Uses the official `mcp` Python package (streamable-http transport).
+Authentication: Bearer token in Authorization header.
 """
 
+from __future__ import annotations
+
 import json
-import time
-import httpx
+from contextlib import asynccontextmanager
+from typing import Any
+
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
 
 
 class EternaMCPClient:
+    """
+    Thin wrapper around an MCP ClientSession that calls Eterna tools directly.
+    Use as an async context manager.
+    """
+
     def __init__(self, url: str, api_key: str | None = None):
-        self.url = url.rstrip("/")
+        self.url = url
         self.api_key = api_key
-        self.session_id: str | None = None
-        self._request_id = 0
-        self._client = httpx.Client(timeout=120.0)
+        self._session: ClientSession | None = None
+        self._exit_stack = None
 
-    def _next_id(self) -> int:
-        self._request_id += 1
-        return self._request_id
-
-    def _headers(self) -> dict:
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json, text/event-stream",
-        }
+    async def __aenter__(self) -> "EternaMCPClient":
+        headers = {}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
-        if self.session_id:
-            headers["Mcp-Session-Id"] = self.session_id
-        return headers
 
-    def _send(self, payload: dict) -> dict:
-        response = self._client.post(self.url, json=payload, headers=self._headers())
-        response.raise_for_status()
-
-        # Capture session ID from response headers
-        if "mcp-session-id" in response.headers:
-            self.session_id = response.headers["mcp-session-id"]
-
-        content_type = response.headers.get("content-type", "")
-        if "text/event-stream" in content_type:
-            return self._parse_sse(response.text)
-        return response.json()
-
-    def _parse_sse(self, text: str) -> dict:
-        """Parse SSE stream and return the last JSON-RPC result."""
-        last_result = None
-        for line in text.splitlines():
-            if line.startswith("data:"):
-                data = line[5:].strip()
-                if data and data != "[DONE]":
-                    try:
-                        obj = json.loads(data)
-                        if "result" in obj or "error" in obj:
-                            last_result = obj
-                    except json.JSONDecodeError:
-                        pass
-        if last_result is None:
-            raise ValueError(f"No valid JSON-RPC result in SSE stream: {text[:500]}")
-        return last_result
-
-    def initialize(self):
-        """Perform the MCP initialization handshake."""
-        init_payload = {
-            "jsonrpc": "2.0",
-            "id": self._next_id(),
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {"name": "eterna-trading-agent", "version": "1.0.0"},
-            },
-        }
-        self._send(init_payload)
-
-        # Send initialized notification (no response expected)
-        notif_payload = {
-            "jsonrpc": "2.0",
-            "method": "notifications/initialized",
-            "params": {},
-        }
-        try:
-            self._client.post(self.url, json=notif_payload, headers=self._headers())
-        except Exception:
-            pass  # Notifications may return 202 or empty body
-
-    def execute_code(self, code: str) -> dict:
-        """
-        Run TypeScript code in the Eterna Deno sandbox.
-        Returns the parsed result dict from the execution response.
-        """
-        payload = {
-            "jsonrpc": "2.0",
-            "id": self._next_id(),
-            "method": "tools/call",
-            "params": {
-                "name": "execute_code",
-                "arguments": {"code": code},
-            },
-        }
-        response = self._send(payload)
-
-        if "error" in response:
-            raise RuntimeError(f"MCP error: {response['error']}")
-
-        # Unwrap: result.content[0].text -> JSON string -> {success, result, ...}
-        content = response["result"]["content"]
-        text = content[0]["text"]
-        parsed = json.loads(text)
-
-        if not parsed.get("success"):
-            error_msg = parsed.get("error", "Unknown execution error")
-            logs = parsed.get("logs", [])
-            raise RuntimeError(f"Execution failed: {error_msg}\nLogs: {logs}")
-
-        return parsed.get("result", {})
-
-    def search_sdk(self, query: str) -> str:
-        """Search the Eterna SDK documentation."""
-        payload = {
-            "jsonrpc": "2.0",
-            "id": self._next_id(),
-            "method": "tools/call",
-            "params": {
-                "name": "search_sdk",
-                "arguments": {"query": query},
-            },
-        }
-        response = self._send(payload)
-
-        if "error" in response:
-            raise RuntimeError(f"MCP error: {response['error']}")
-
-        content = response["result"]["content"]
-        return content[0]["text"]
-
-    def close(self):
-        self._client.close()
-
-    def __enter__(self):
-        self.initialize()
+        self._cm = streamablehttp_client(self.url, headers=headers)
+        read, write, _ = await self._cm.__aenter__()
+        self._session = ClientSession(read, write)
+        await self._session.__aenter__()
+        await self._session.initialize()
         return self
 
-    def __exit__(self, *_):
-        self.close()
+    async def __aexit__(self, *args):
+        if self._session:
+            await self._session.__aexit__(*args)
+        await self._cm.__aexit__(*args)
+
+    async def call(self, tool_name: str, args: dict | None = None) -> Any:
+        """Call an Eterna tool and return the parsed result."""
+        result = await self._session.call_tool(tool_name, args or {})
+        # MCP returns content list; extract and parse the first text item
+        for item in result.content:
+            text = item.text if hasattr(item, "text") else str(item)
+            try:
+                return json.loads(text)
+            except (json.JSONDecodeError, TypeError):
+                return text
+        return None
+
+    # ------------------------------------------------------------------
+    # Registration (unauthenticated)
+    # ------------------------------------------------------------------
+
+    async def register_agent(self, name: str) -> dict:
+        return await self.call("register_agent", {"name": name})
+
+    # ------------------------------------------------------------------
+    # Market data
+    # ------------------------------------------------------------------
+
+    async def get_tickers(self, symbol: str | None = None) -> list[dict]:
+        args = {}
+        if symbol:
+            args["symbol"] = symbol
+        return await self.call("get_tickers", args)
+
+    async def get_instruments(self, symbol: str | None = None) -> list[dict]:
+        args = {}
+        if symbol:
+            args["symbol"] = symbol
+        return await self.call("get_instruments", args)
+
+    async def get_orderbook(self, symbol: str, limit: int = 25) -> dict:
+        return await self.call("get_orderbook", {"symbol": symbol, "limit": limit})
+
+    # ------------------------------------------------------------------
+    # Account
+    # ------------------------------------------------------------------
+
+    async def get_balance(self) -> dict:
+        return await self.call("get_balance", {})
+
+    async def get_positions(self, symbol: str | None = None) -> list[dict]:
+        args = {}
+        if symbol:
+            args["symbol"] = symbol
+        return await self.call("get_positions", args)
+
+    async def get_orders(self, symbol: str | None = None) -> list[dict]:
+        args = {}
+        if symbol:
+            args["symbol"] = symbol
+        return await self.call("get_orders", args)
+
+    # ------------------------------------------------------------------
+    # Trading
+    # ------------------------------------------------------------------
+
+    async def place_order(
+        self,
+        symbol: str,
+        side: str,
+        order_type: str,
+        qty: str,
+        price: str | None = None,
+        leverage: str | None = None,
+        take_profit: str | None = None,
+        stop_loss: str | None = None,
+        reduce_only: bool = False,
+    ) -> dict:
+        args: dict[str, Any] = {
+            "symbol": symbol,
+            "side": side,
+            "orderType": order_type,
+            "qty": qty,
+            "reduceOnly": reduce_only,
+        }
+        if price:
+            args["price"] = price
+        if leverage:
+            args["leverage"] = leverage
+        if take_profit:
+            args["takeProfit"] = take_profit
+        if stop_loss:
+            args["stopLoss"] = stop_loss
+        return await self.call("place_order", args)
+
+    async def close_position(self, symbol: str) -> dict:
+        return await self.call("close_position", {"symbol": symbol})
+
+    # ------------------------------------------------------------------
+    # Funding
+    # ------------------------------------------------------------------
+
+    async def get_deposit_address(self, coin: str, chain_type: str) -> dict:
+        return await self.call("get_deposit_address", {"coin": coin, "chainType": chain_type})
+
+    async def get_deposit_records(self, coin: str | None = None) -> dict:
+        args = {}
+        if coin:
+            args["coin"] = coin
+        return await self.call("get_deposit_records", args)
+
+    async def transfer_to_trading(self, coin: str, amount: str) -> dict:
+        return await self.call("transfer_to_trading", {"coin": coin, "amount": amount})

@@ -1,14 +1,15 @@
 """
 Eterna Trading Agent — main entry point.
 
-Uses Claude (claude-opus-4-7) with adaptive thinking as the decision-making brain.
-Executes trades via the Eterna MCP server through execute_code calls.
+Uses Claude (claude-opus-4-7) as the decision-making brain.
+Trades via the Eterna MCP Gateway (12 direct trading tools).
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
-import sys
+
 import anthropic
 
 import config
@@ -21,47 +22,58 @@ from tools import TOOL_DEFINITIONS, dispatch_tool
 
 SYSTEM_PROMPT = """\
 You are an expert algorithmic trading agent for cryptocurrency perpetual futures \
-on the Eterna exchange.
+on the Eterna exchange (powered by Bybit infrastructure).
 
 Your goal is to {objective}.
 
-## Core Trading Guidelines
+## Workflow
 
-- **Check before trading**: Always call get_account_status first to know your balance \
-and open positions.
-- **Position sizing**: Never risk more than {max_risk_pct}% of available balance per trade. \
-Calculate position size based on the distance to your stop-loss.
-- **Stop-losses are mandatory**: Every new position must have a stop-loss set at order \
-placement time. No exceptions.
-- **Leverage discipline**: Default to {default_leverage}x leverage. Never exceed \
-{max_leverage}x. Lower leverage for volatile markets.
-- **Confirm signals**: Before entering a trade, gather at least 2-3 confirming signals \
-from different indicators (e.g., RSI + MACD trend + EMA alignment).
-- **Monitor positions**: Regularly review open positions. Move stop-losses to break-even \
-once a position is 1% in profit.
-- **Risk/reward**: Only enter trades with a minimum 2:1 reward-to-risk ratio.
+Before every trading session:
+1. Call `get_balance` to check available capital.
+2. Call `get_positions` to know current exposure.
+3. Call `get_orders` to see any pending orders.
 
-## Market Analysis Approach
+## Position Sizing
 
-1. Identify trending symbols from market data (high volume, strong momentum).
-2. Check RSI (oversold <30 for long, overbought >70 for short).
-3. Confirm trend direction with MACD (signal line cross).
-4. Use EMA/SMA for trend alignment (price above EMA = bullish).
-5. Bollinger Bands for volatility and breakout detection.
-6. Check funding rate — avoid longs when funding is very high (>0.1%).
+Use this formula:
+  target_notional = totalEquity / 4       (allocate 25% of equity per position)
+  qty = target_notional / lastPrice       (round DOWN to instrument lotSize)
 
-## Order Execution Rules
+Always call `get_instruments` for the symbol's `lotSize` before placing an order.
+Maximum 4 open positions simultaneously. Maximum leverage: {max_leverage}x (default: {default_leverage}x).
+Minimum account balance: $20 USDT — do not trade below this.
 
-- Use Market orders for entries in trending markets.
-- Use Limit orders near support/resistance for better fills.
-- Close positions partially at first target, move stop to break-even.
-- When in doubt, do not trade. Capital preservation is priority #1.
+## Entry Signals (Momentum Scalping)
+
+1. Scan `get_tickers`: positive `price24hPcnt` > +0.3% for long, < -0.3% for short.
+2. Confirm with `get_orderbook`: bid_volume >= 1.1 × ask_volume (long), or ask >= 1.1 × bid (short).
+3. Both signals must align. No signal = no trade.
+
+## Exit Rules
+
+- Take profit: 1.0% from entry price.
+- Stop loss: 0.6% from entry price. **Always set `stopLoss` on every order.**
+- Set `takeProfit` and `stopLoss` at order placement time. Let the exchange handle exits.
+
+## Risk Rules
+
+- Never risk more than {max_risk_pct}% of equity on a single trade.
+- Do not open a second position on a symbol already held.
+- If no balance is available for a new position, report the status and do not trade.
+
+## Deposit Flow (if balance is zero)
+
+1. Call `get_deposit_address` with coin `USDT`, chainType `ARBI`.
+2. Report the address for the user to send USDT.
+3. After funds arrive, call `get_deposit_records` to confirm.
+4. Call `transfer_to_trading` to move funds to the trading wallet.
 
 ## Preferred Symbols
 
 {preferred_symbols}
 
-Always explain your reasoning before executing any trade.\
+Always explain your reasoning before executing any trade. \
+State the entry price, stop-loss, take-profit, and position size calculation.\
 """
 
 
@@ -79,22 +91,20 @@ def build_system_prompt() -> str:
 # Agent loop
 # ---------------------------------------------------------------------------
 
-def run_agent(user_message: str, verbose: bool = True) -> str:
+async def run_agent(user_message: str, verbose: bool = True) -> str:
     """
     Run a single agent session: send user_message, let Claude use tools
-    until it reaches end_turn, and return the final text response.
+    until end_turn, and return the final text response.
     """
     client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
-
     messages: list[dict] = [{"role": "user", "content": user_message}]
     system = build_system_prompt()
 
-    with EternaMCPClient(config.ETERNA_MCP_URL, config.ETERNA_API_KEY) as mcp:
+    async with EternaMCPClient(config.ETERNA_MCP_URL, config.ETERNA_API_KEY) as mcp:
         for round_num in range(config.MAX_TOOL_ROUNDS):
             if verbose:
                 print(f"\n[Round {round_num + 1}] Calling Claude...", flush=True)
 
-            # Stream the response
             with client.messages.stream(
                 model="claude-opus-4-7",
                 max_tokens=8096,
@@ -114,13 +124,10 @@ def run_agent(user_message: str, verbose: bool = True) -> str:
             if verbose:
                 _print_response(response)
 
-            # Add assistant turn to history
             messages.append({"role": "assistant", "content": response.content})
-
             stop_reason = response.stop_reason
 
             if stop_reason == "end_turn":
-                # Extract final text
                 return _extract_text(response)
 
             if stop_reason in ("tool_use", "pause_turn"):
@@ -133,19 +140,20 @@ def run_agent(user_message: str, verbose: bool = True) -> str:
                     tool_input = block.input
 
                     if verbose:
-                        print(f"  -> Tool: {tool_name}({json.dumps(tool_input, indent=2)})", flush=True)
+                        print(f"  -> {tool_name}({json.dumps(tool_input, indent=2)})", flush=True)
 
                     try:
-                        result = dispatch_tool(mcp, tool_name, tool_input)
+                        result = await dispatch_tool(mcp, tool_name, tool_input)
+                        content = json.dumps(result, default=str)
                         tool_results.append(
                             {
                                 "type": "tool_result",
                                 "tool_use_id": block.id,
-                                "content": json.dumps(result, default=str),
+                                "content": content,
                             }
                         )
                         if verbose:
-                            print(f"  <- {json.dumps(result, default=str)[:300]}", flush=True)
+                            print(f"  <- {content[:400]}", flush=True)
                     except Exception as exc:
                         error_msg = str(exc)
                         if verbose:
@@ -163,28 +171,21 @@ def run_agent(user_message: str, verbose: bool = True) -> str:
                     messages.append({"role": "user", "content": tool_results})
                 continue
 
-            # Unexpected stop reason
-            break
+            break  # Unexpected stop reason
 
     return _extract_text(response)
 
 
 def _extract_text(response) -> str:
-    parts = []
-    for block in response.content:
-        if hasattr(block, "text"):
-            parts.append(block.text)
-    return "\n".join(parts)
+    return "\n".join(
+        block.text for block in response.content if hasattr(block, "text")
+    )
 
 
 def _print_response(response) -> None:
     for block in response.content:
         if hasattr(block, "text"):
             print(f"\n[Claude]: {block.text}", flush=True)
-        elif block.type == "thinking":
-            pass  # thinking content omitted by default on Opus 4.7
-        elif block.type == "tool_use":
-            pass  # printed in the tool dispatch section
 
 
 # ---------------------------------------------------------------------------
@@ -199,9 +200,9 @@ def main():
         "instruction",
         nargs="?",
         default=(
-            "Analyze the current market conditions for the preferred symbols, "
-            "identify the best trading opportunity, and execute a trade if conditions are favorable. "
-            "Start by checking account status."
+            "Check account status (balance, positions, orders), then scan the preferred "
+            "symbols for momentum trading opportunities. If a clear setup exists with "
+            "confirming signals, execute a trade with proper stop-loss and take-profit."
         ),
         help="Trading instruction for the agent",
     )
@@ -213,7 +214,7 @@ def main():
     print("=" * 60)
     print(f"Instruction: {args.instruction}\n")
 
-    result = run_agent(args.instruction, verbose=not args.quiet)
+    result = asyncio.run(run_agent(args.instruction, verbose=not args.quiet))
 
     print("\n" + "=" * 60)
     print("Final response:")
